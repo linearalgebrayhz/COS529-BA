@@ -1,12 +1,20 @@
-from operator import inv
 import numpy as np
 import pickle
 import argparse
 
+def skew_sym(vec):
+    return np.array([[0, -vec[2], vec[1]],
+                     [vec[2], 0, -vec[0]],
+                     [-vec[1], vec[0], 0]])
+
 def rotation_to_vector(R) -> np.ndarray:
     theta = np.arccos((np.trace(R)-1)/2)
-    axis = np.linalg.solve(R-np.identity(3),np.zeros(3))
+
+    U, S, Vt = np.linalg.svd(R - np.eye(3)) # better not use solve
+    axis = Vt[-1, :]
     axis /= np.linalg.norm(axis)
+    
+    # TODO: R is trivial rotation?
     
     return theta*axis # psi
 
@@ -17,13 +25,15 @@ def vector_to_rotation(v) -> np.ndarray:
         return np.eye(3)
     axis = v/theta
     
-    skew = np.array([[0, -axis[2], axis[1]],
-                     axis[2], 0, -axis[1],
-                     -axis[1], axis[0], 0])
+    skew = skew_sym(axis)
     
-    R = np.eye(3) + (1-np.cos(theta))*v@v.T + np.sin(theta)*skew
-    
-    return R
+    R = np.eye(3) + (1-np.cos(theta))*axis@axis.T + np.sin(theta)*skew
+    U, _, Vt = np.linalg.svd(R)
+    R_proj = U @ Vt
+    if np.linalg.det(R_proj) < 0:
+        Vt[-1, :] *= -1
+        R_proj = U @ Vt
+    return R_proj
 
 # TODO: consider sparse structure
 
@@ -32,9 +42,9 @@ def pack_params(problem) -> np.ndarray:
     n_cameras = problem['poses'].shape[0]
     calib_flag = problem['is_calibrated']
     for i in range(n_cameras):
-        R = problem['poses'][i,:,:3]
+        R = problem['poses'][i,:3,:3]
         r = rotation_to_vector(R)
-        t = problem['poses'][i,:,3]
+        t = problem['poses'][i,:3, 3]
         params.extend(r)
         params.extend(t)
         if not calib_flag:
@@ -95,20 +105,27 @@ def reprojection_error(params, problem):
             continue
         x_proj = f * X_Cam_coord[0] / Z
         y_proj = f * X_Cam_coord[1] / Z
-        error_x = x - x_proj
-        error_y = y - y_proj
+        error_x = x_proj - x 
+        error_y = y_proj - y
         
         errors.extend([error_x, error_y])
     
     return np.array(errors)
 
+def lstsq(error):
+    return 0.5*np.sum(error**2)
+
 def compute_jacobian(problem, data):
+    """
+    problem (dict): contains the problem definition
+    data (dict): contains the current state of the problem ? 
+    """
     n_cameras = problem['poses'].shape[0]
     n_points = problem['points'].shape[0]
-    cam_param_size = 6 if not problem['is_calibrated'] else 7
+    cam_param_size = 6 if problem['is_calibrated'] else 7
     # blocks
     A = {i: np.zeros((cam_param_size, cam_param_size)) for i in range(n_cameras)}
-    B = {i: np.zeros((3, 3)) for i in range(n_cameras)}
+    B = {i: np.zeros((3, 3)) for i in range(n_points)}
     C = {} # dense
     
     """
@@ -130,6 +147,8 @@ def compute_jacobian(problem, data):
         
         # for stability
         # TODO: check if Z_prime is small?
+        if Z_prime < 1e-6:
+            continue
         inv_Z = 1 / Z_prime
         inv_Z2 = inv_Z * inv_Z
         
@@ -137,14 +156,38 @@ def compute_jacobian(problem, data):
         J_p = np.zeros((2, 3))
         
         # How to compute small jacobian blocks?
+        residual = np.array([f * X_prime * inv_Z - x ,f * Y_prime * inv_Z - y]) 
+        
+        proj_jacobian = f * np.array([[inv_Z, 0, - X_prime * inv_Z2],
+                                  [0, inv_Z, - Y_prime * inv_Z2]])
+        
+        focal_jacobian = np.zeros((3, 1))
+        
+        if not problem['is_calibrated']:
+            focal_jacobian = np.array([[X_prime * inv_Z], [Y_prime * inv_Z], [0]])
+        
+        translation_jacobian = np.eye(3)
+        
+        point_jacobian = R
+        
+        rotation_jacobian = - skew_sym(R @ X) # why?
+        
+        cam = np.hstack([rotation_jacobian, translation_jacobian])
+        
+        if not problem['is_calibrated']:
+            cam = np.hstack([cam, focal_jacobian])
+        
+        J_c = (proj_jacobian @ cam)
+        J_p = (proj_jacobian @ point_jacobian)
         
         A[cam_id] += J_c.T @ J_c
-        B[cam_id] += J_p.T @ J_p
+        B[point_id] += J_p.T @ J_p
         C_key = (cam_id, point_id)
-        C[C_key] = ...
+        C[C_key] = C.get(C_key, np.zeros((cam_param_size, 3))) + J_c.T @ J_p
         
-    
-    
+        JTr_cam[cam_id * cam_param_size : (cam_id+1)*cam_param_size] -= J_c.T @ residual
+        JTr_point[point_id * 3 : (point_id+1)*3] -= J_p.T @ residual
+        
     return A, B, C, JTr_cam, JTr_point
         
 def shur_complement(problem, A, B, C, JTr_cam, JTr_point, lambda_):
@@ -155,28 +198,37 @@ def shur_complement(problem, A, B, C, JTr_cam, JTr_point, lambda_):
         B (_type_): block diagonal matrices, (M, 3, 3)
         C (_type_): dense matrices, (cam_param_size, 3)
     """
-    
+    n_cameras = problem['poses'].shape[0]
+    cam_param_size = 6 if problem['is_calibrated'] else 7
     B_inv = {}
-    for point_id in B:
-        B_inv[point_id] = np.linalg.inv(B[point_id] + lambda_ * np.eye(3)) # B + lambda*I
+    for point_id in B.keys():
+        B_inv[point_id] = np.linalg.inv(B[point_id] + lambda_ * np.eye(3)) # numerical stability
     # compute S = A - C * B^{-1} * C^T
     S = A.copy()
     for (cam_id, point_id), C_block in C.items():
+        # print(B_inv.keys(), point_id, cam_id)
         B_inv_block = B_inv[point_id]
         update = C_block @ B_inv_block @ C_block.T
         S[cam_id] -= update
         
     for cam_id in S:
-        diag = np.diag(S[cam_id]) # ?
-        diag *= (1 + lambda_)
-        np.fill_diagonal(S[cam_id], diag)
+        diag = np.diag(S[cam_id]).copy()
+        np.fill_diagonal(S[cam_id], diag + lambda_ * np.ones_like(diag))
         
     # solve for delta
-    delta_cam = np.linalg.solve(S, JTr_cam)
+    delta_cam = list()
+    
+    for cam_id in range(n_cameras):
+        start_idx = cam_id * cam_param_size
+        end_idx = start_idx + cam_param_size
+        delta = np.linalg.solve(S[cam_id], JTr_cam[start_idx:end_idx])
+        delta_cam.append(delta)
+    
+    delta_cam = np.concatenate(delta_cam)
     
     delta_point = np.zeros_like(JTr_point)
     
-    cam_param_size = 6 if not problem['is_calibrated'] else 7
+    # cam_param_size = 6 if problem['is_calibrated'] else 7
     
     for (cam_id, point_id), C_block in C.items():
         start = point_id * 3
@@ -197,12 +249,23 @@ def LM_Sparse(problem, max_iter = 100):
         if cost >= prev_cost:
             lambda_ *= 2
         else:
-            lambda_ *= 0.8
+            lambda_ *= 0.5
             prev_cost = cost
-    A, B, C, JTr_cam, JTr_points = compute_jacobian(problem, data)
-            
+        A, B, C, JTr_cam, JTr_points = compute_jacobian(problem, data)
+        delta = shur_complement(problem, A, B, C, JTr_cam, JTr_points, lambda_)
+        params += 0.005 * delta
+        validate_rotations(unpack_params(params, problem)['poses'], iter = _)
+    return unpack_params(params, problem)            
 
-
+def validate_rotations(poses, iter = 1000):
+    print(f"iter: {iter}")
+    for cam_id, cam_pose in enumerate(poses):
+        R = cam_pose[:3, :3]
+        if not np.allclose(R.T @ R, np.eye(3), atol=1e-5):
+            print(f"Camera {cam_id}: Invalid rotation matrix: R^T R ≠ I")
+        if not np.isclose(np.linalg.det(R), 1.0, atol=1e-5):
+            print(f"Camera {cam_id}:Invalid rotation matrix: det(R) ≠ 1")
+    return True
 
 def solve_ba_problem(problem):
     '''
@@ -231,8 +294,21 @@ def solve_ba_problem(problem):
 
     solution = problem
     # YOUR CODE STARTS
-
-
+    
+    # print(f"problem: {problem['poses'].shape} \n", f"points: {problem['points'].shape} \n", f"focal_lengths: {problem['focal_lengths'].shape} \n")
+    # print(f"is_calibrated: {problem['is_calibrated']} \n")
+    
+    optimize = LM_Sparse(problem)
+    
+    for key in optimize.keys():
+        if key == 'focal_lengths':
+            solution[key] = optimize[key]
+        elif key == 'points':
+            solution[key] = optimize[key]
+        elif key == 'poses':
+            solution[key] = optimize[key]
+    validate_rotations(solution['poses'])
+    
     return solution
 
 
