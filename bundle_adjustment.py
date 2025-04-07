@@ -2,6 +2,10 @@ import numpy as np
 import pickle
 import argparse
 
+import resource
+import signal
+import tracemalloc
+
 def skew_sym(vec):
     return np.array([[0, -vec[2], vec[1]],
                      [vec[2], 0, -vec[0]],
@@ -10,7 +14,8 @@ def skew_sym(vec):
 def rotation_to_vector(R) -> np.ndarray:
     theta = np.arccos((np.trace(R)-1)/2)
 
-    U, S, Vt = np.linalg.svd(R - np.eye(3)) # better not use solve
+    # TODO: How to solve axis
+    U, S, Vt = np.linalg.svd(R - np.eye(3)) # better not use solve (Rx = x)
     axis = Vt[-1, :]
     axis /= np.linalg.norm(axis)
     
@@ -24,18 +29,22 @@ def vector_to_rotation(v) -> np.ndarray:
     if theta < 1e-6:
         return np.eye(3)
     axis = v/theta
+    # print(axis.shape)
+    # exit()
     
     skew = skew_sym(axis)
     
-    R = np.eye(3) + (1-np.cos(theta))*axis@axis.T + np.sin(theta)*skew
-    U, _, Vt = np.linalg.svd(R)
-    R_proj = U @ Vt
-    if np.linalg.det(R_proj) < 0:
-        Vt[-1, :] *= -1
-        R_proj = U @ Vt
-    return R_proj
+    # TODO: Projection to SO(3) with SVD, is this necessary step?
+    R = np.eye(3) + (1-np.cos(theta))*skew@skew + np.sin(theta)*skew
+    
+    # U, _, Vt = np.linalg.svd(R)
+    # R_proj = U @ Vt
+    # if np.linalg.det(R_proj) < 0:
+    #     Vt[-1, :] *= -1
+    #     R_proj = U @ Vt
+    return R
 
-# TODO: consider sparse structure
+
 
 def pack_params(problem) -> np.ndarray:
     params = []
@@ -87,9 +96,9 @@ def unpack_params(params, problem):
 # reprojection error for each observation
 def reprojection_error(params, problem):
     data = unpack_params(params, problem)
-    errors = []
+    errors = np.zeros((len(problem['observations']) * 2))
     
-    for obs in problem['observations']:
+    for i, obs in enumerate(problem['observations']):
         cam_id, point_id, x, y = obs
         X = data['points'][point_id]
         P = data['poses'][cam_id]
@@ -101,16 +110,15 @@ def reprojection_error(params, problem):
         # TODO: determine the criterion for small value, 1e-5? 1e-6?
         
         if Z < 1e-6:
-            errors.extend([0.0, 0.0])
+            errors[2*i:2*i+2] = 0
             continue
         x_proj = f * X_Cam_coord[0] / Z
         y_proj = f * X_Cam_coord[1] / Z
-        error_x = x_proj - x 
-        error_y = y_proj - y
-        
-        errors.extend([error_x, error_y])
+
+        errors[2*i] = x_proj - x
+        errors[2*i+1] = y_proj - y
     
-    return np.array(errors)
+    return errors
 
 def lstsq(error):
     return 0.5*np.sum(error**2)
@@ -118,12 +126,14 @@ def lstsq(error):
 def compute_jacobian(problem, data):
     """
     problem (dict): contains the problem definition
-    data (dict): contains the current state of the problem ? 
+    data (dict): contains the current state of the problem
     """
     n_cameras = problem['poses'].shape[0]
     n_points = problem['points'].shape[0]
     cam_param_size = 6 if problem['is_calibrated'] else 7
     # blocks
+    
+    # TODO: Using dict to store block diagonal matrices, is this efficient enough?
     A = {i: np.zeros((cam_param_size, cam_param_size)) for i in range(n_cameras)}
     B = {i: np.zeros((3, 3)) for i in range(n_points)}
     C = {} # dense
@@ -156,6 +166,7 @@ def compute_jacobian(problem, data):
         J_p = np.zeros((2, 3))
         
         # How to compute small jacobian blocks?
+        # Compare jacobian with numerical jacobian
         residual = np.array([f * X_prime * inv_Z - x ,f * Y_prime * inv_Z - y]) 
         
         proj_jacobian = f * np.array([[inv_Z, 0, - X_prime * inv_Z2],
@@ -213,7 +224,7 @@ def shur_complement(problem, A, B, C, JTr_cam, JTr_point, lambda_):
         
     for cam_id in S:
         diag = np.diag(S[cam_id]).copy()
-        np.fill_diagonal(S[cam_id], diag + lambda_ * np.ones_like(diag))
+        np.fill_diagonal(S[cam_id], diag + (lambda_ + 1e-8) * np.ones_like(diag))
         
     # solve for delta
     delta_cam = list()
@@ -239,13 +250,20 @@ def shur_complement(problem, A, B, C, JTr_cam, JTr_point, lambda_):
 
 def LM_Sparse(problem, max_iter = 100):
     params = pack_params(problem)
-    lambda_ = 1e-3
+    lambda_ = 1e-4
     prev_cost = np.inf
+    obs = len(problem['observations'])
     
     for _ in range(max_iter):
         data = unpack_params(params, problem)
         errors = reprojection_error(params, problem)
-        cost = 0.5 * np.sum(errors**2)
+        cost = 0.5*np.sum(errors**2)
+        msqe = np.sum(np.sqrt(errors**2))/obs
+        
+        # TODO: What is the condition for convergence? The mean loss, the norm of the update? How to select proper delta
+        if  msqe <= 0.1:
+            print("Converged")
+            break
         if cost >= prev_cost:
             lambda_ *= 2
         else:
@@ -253,18 +271,26 @@ def LM_Sparse(problem, max_iter = 100):
             prev_cost = cost
         A, B, C, JTr_cam, JTr_points = compute_jacobian(problem, data)
         delta = shur_complement(problem, A, B, C, JTr_cam, JTr_points, lambda_)
-        params += 0.005 * delta
-        validate_rotations(unpack_params(params, problem)['poses'], iter = _)
+        
+        # TODO: Choice of learning rate
+        update = delta * 0.1
+        
+        if np.linalg.norm(update) < 1e-5:
+            print("Converged")
+            break
+        params += update
+        if _ % 100 == 0:
+            validate_rotations(unpack_params(params, problem)['poses'], iter = _)
+        print(f"iter: {_}, cost: {msqe}, update: {np.linalg.norm(update)}")
     return unpack_params(params, problem)            
 
 def validate_rotations(poses, iter = 1000):
-    print(f"iter: {iter}")
     for cam_id, cam_pose in enumerate(poses):
         R = cam_pose[:3, :3]
         if not np.allclose(R.T @ R, np.eye(3), atol=1e-5):
-            print(f"Camera {cam_id}: Invalid rotation matrix: R^T R ≠ I")
+            print(f"iter {iter} Camera {cam_id}: Invalid rotation matrix: R^T R ≠ I")
         if not np.isclose(np.linalg.det(R), 1.0, atol=1e-5):
-            print(f"Camera {cam_id}:Invalid rotation matrix: det(R) ≠ 1")
+            print(f"iter {iter} Camera {cam_id}:Invalid rotation matrix: det(R) ≠ 1")
     return True
 
 def solve_ba_problem(problem):
@@ -297,7 +323,7 @@ def solve_ba_problem(problem):
     
     # print(f"problem: {problem['poses'].shape} \n", f"points: {problem['points'].shape} \n", f"focal_lengths: {problem['focal_lengths'].shape} \n")
     # print(f"is_calibrated: {problem['is_calibrated']} \n")
-    
+    solution['observations'] = sorted(solution['observations'], key=lambda x: (x[1], x[0]))
     optimize = LM_Sparse(problem)
     
     for key in optimize.keys():
@@ -311,15 +337,31 @@ def solve_ba_problem(problem):
     
     return solution
 
+def set_max_runtime(ms):
+    soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+    resource.setrlimit(resource.RLIMIT_CPU, (ms, hard))
+    signal.signal(signal.SIGXCPU, exit_function)
 
+
+def limit_memory(maxbytes):
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (maxbytes, hard))
+    signal.signal(signal.SIGXCPU, exit_function)
+    
+def exit_function(signo, frame):
+    raise SystemExit(1)
 
 if __name__ == '__main__':
+    # set_max_runtime(600)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--problem', help="config file")
     args = parser.parse_args()
 
     problem = pickle.load(open(args.problem, 'rb'))
+    
+    limit_memory(1073741824) # 1GB
+    
     solution = solve_ba_problem(problem)
 
     solution_path = args.problem.replace(".pickle", "-solution.pickle")
