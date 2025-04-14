@@ -13,13 +13,16 @@ def skew_sym(vec):
 
 def rotation_to_vector(R) -> np.ndarray:
     theta = np.arccos((np.trace(R)-1)/2)
+    if theta < 1e-6:
+        return np.zeros(3)
+    axis = np.array([R[2, 1] - R[1, 2],
+                     R[0, 2] - R[2, 0],
+                     R[1, 0] - R[0, 1]]) / (2 * np.sin(theta))
+    # axis = 1/(2*np.sin(theta)) * np.array([R[2,1]-R[1][2], R[0][2] - R[2][0], R[1][0]-R[0][1]])
 
-    # TODO: How to solve axis
-    U, S, Vt = np.linalg.svd(R - np.eye(3)) # better not use solve (Rx = x)
-    axis = Vt[-1, :]
-    axis /= np.linalg.norm(axis)
-    
-    # TODO: R is trivial rotation?
+    # U, S, Vt = np.linalg.svd(R - np.eye(3)) # better not use solve (Rx = x)
+    # axis = Vt[-1, :]
+    # axis /= np.linalg.norm(axis)
     
     return theta*axis # psi
 
@@ -34,7 +37,6 @@ def vector_to_rotation(v) -> np.ndarray:
     
     skew = skew_sym(axis)
     
-    # TODO: Projection to SO(3) with SVD, is this necessary step?
     R = np.eye(3) + (1-np.cos(theta))*skew@skew + np.sin(theta)*skew
     
     # U, _, Vt = np.linalg.svd(R)
@@ -120,6 +122,148 @@ def reprojection_error(params, problem):
     
     return errors
 
+def numerical_diff(f, R, t, X, x, y, epsilon = 1e-8):
+    jacobian = []
+    
+    old_coord = R@X+t
+    x_old, y_old, z_old = old_coord
+    inv_z_old = 1/z_old
+    error_old = np.array([f * x_old * inv_z_old - x ,f * y_old * inv_z_old - y])
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([epsilon, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, epsilon, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, epsilon]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([epsilon, 0, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, epsilon, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, epsilon])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + epsilon
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([epsilon, 0, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, epsilon, 0])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    updated_R = vector_to_rotation(rotation_to_vector(R) + np.array([0, 0, 0]))
+    updated_f = f + 0
+    updated_t = t + np.array([0, 0, 0])
+    updated_X = X + np.array([0, 0, epsilon])
+    new_coord = updated_R@updated_X + updated_t
+    x_new, y_new, z_new = new_coord
+    inv_z_new = 1/z_new
+    error_new = np.array([updated_f * x_new * inv_z_new - x ,updated_f * y_new * inv_z_new - y])
+    
+    diff = (error_new - error_old)/epsilon
+    
+    jacobian.append(diff)
+    
+    jacobian = np.vstack(jacobian)
+        
+    return jacobian.T
+
 def lstsq(error):
     return 0.5*np.sum(error**2)
 
@@ -152,11 +296,10 @@ def compute_jacobian(problem, data):
         P = data['poses'][cam_id]
         R, t = P[:,:3], P[:,3]
         f = data['focal_lengths'][cam_id] if not problem['is_calibrated'] else problem['focal_lengths'][cam_id]
+        K = np.diag([f,f,1])
         X_Cam_coord = R @ X + t
         X_prime, Y_prime, Z_prime = X_Cam_coord
-        
-        # for stability
-        # TODO: check if Z_prime is small?
+
         if Z_prime < 1e-6:
             continue
         inv_Z = 1 / Z_prime
@@ -165,32 +308,36 @@ def compute_jacobian(problem, data):
         J_c = np.zeros((2, cam_param_size))
         J_p = np.zeros((2, 3))
         
-        # How to compute small jacobian blocks?
-        # Compare jacobian with numerical jacobian
         residual = np.array([f * X_prime * inv_Z - x ,f * Y_prime * inv_Z - y]) 
         
-        proj_jacobian = f * np.array([[inv_Z, 0, - X_prime * inv_Z2],
+        proj_jacobian =  f*np.array([[inv_Z, 0, - X_prime * inv_Z2],
                                   [0, inv_Z, - Y_prime * inv_Z2]])
         
-        focal_jacobian = np.zeros((3, 1))
+        focal_jacobian = np.zeros((2, 1))
         
         if not problem['is_calibrated']:
-            focal_jacobian = np.array([[X_prime * inv_Z], [Y_prime * inv_Z], [0]])
+            focal_jacobian = np.array([[X_prime*inv_Z], [Y_prime*inv_Z]])
         
         translation_jacobian = np.eye(3)
         
-        point_jacobian = R
+        point_jacobian =  R
         
         rotation_jacobian = - skew_sym(R @ X) # why?
         
         cam = np.hstack([rotation_jacobian, translation_jacobian])
         
-        if not problem['is_calibrated']:
-            cam = np.hstack([cam, focal_jacobian])
         
         J_c = (proj_jacobian @ cam)
+        if not problem['is_calibrated']:
+            J_c = np.hstack([J_c, focal_jacobian])
+            
         J_p = (proj_jacobian @ point_jacobian)
         
+        # print(f"Ana: {np.hstack([J_c, J_p])}")
+        # # from numerical diff
+        # diff = numerical_diff(f, R, t, X, x, y)
+        # print(f"Num: {diff}")
+
         A[cam_id] += J_c.T @ J_c
         B[point_id] += J_p.T @ J_p
         C_key = (cam_id, point_id)
@@ -248,24 +395,29 @@ def shur_complement(problem, A, B, C, JTr_cam, JTr_point, lambda_):
     
     return np.concatenate([delta_cam, delta_point])
 
-def LM_Sparse(problem, max_iter = 100):
+def LM_Sparse(problem, max_iter = 200):
     params = pack_params(problem)
-    lambda_ = 1e-4
+    lambda_ = 1e-2
     prev_cost = np.inf
     obs = len(problem['observations'])
     
     for _ in range(max_iter):
         data = unpack_params(params, problem)
         errors = reprojection_error(params, problem)
+        error_len = len(errors)
         cost = 0.5*np.sum(errors**2)
-        msqe = np.sum(np.sqrt(errors**2))/obs
+        msqe = 0
+        for i in range(error_len//2):
+            msqe += np.sqrt(errors[2*i] ** 2 + errors[2*i+1] ** 2)
+        msqe/=obs
         
         # TODO: What is the condition for convergence? The mean loss, the norm of the update? How to select proper delta
         if  msqe <= 0.1:
             print("Converged")
+            print(f"convergence loss: {msqe}")
             break
         if cost >= prev_cost:
-            lambda_ *= 2
+            lambda_ *= 5
         else:
             lambda_ *= 0.5
             prev_cost = cost
@@ -273,10 +425,11 @@ def LM_Sparse(problem, max_iter = 100):
         delta = shur_complement(problem, A, B, C, JTr_cam, JTr_points, lambda_)
         
         # TODO: Choice of learning rate
-        update = delta * 0.1
+        update = delta * 0.5
         
         if np.linalg.norm(update) < 1e-5:
             print("Converged")
+            print(f"convergence loss: {msqe}")
             break
         params += update
         if _ % 100 == 0:
@@ -321,9 +474,7 @@ def solve_ba_problem(problem):
     solution = problem
     # YOUR CODE STARTS
     
-    # print(f"problem: {problem['poses'].shape} \n", f"points: {problem['points'].shape} \n", f"focal_lengths: {problem['focal_lengths'].shape} \n")
-    # print(f"is_calibrated: {problem['is_calibrated']} \n")
-    solution['observations'] = sorted(solution['observations'], key=lambda x: (x[1], x[0]))
+    # solution['observations'] = sorted(solution['observations'], key=lambda x: (x[1], x[0]))
     optimize = LM_Sparse(problem)
     
     for key in optimize.keys():
@@ -352,7 +503,7 @@ def exit_function(signo, frame):
     raise SystemExit(1)
 
 if __name__ == '__main__':
-    # set_max_runtime(600)
+    set_max_runtime(600)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--problem', help="config file")
